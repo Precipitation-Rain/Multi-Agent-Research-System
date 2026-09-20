@@ -5,8 +5,7 @@ from langchain_groq import ChatGroq
 from tools import web_search , scrape_url
 from dotenv import load_dotenv
 
-llm = ChatGroq(model="openai/gpt-oss-120b")
-
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
 # define the web_search_agentt
 def web_search_agent():
     return create_agent(

@@ -16,6 +16,7 @@ except Exception:
     pass
 
 from agents import web_search_agent, scrape_url_agent, writer_chain, critics_chain
+from tools import web_search, scrape_url
 
 APP_NAME = "Research Desk"
 
@@ -267,6 +268,25 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:50] or "report"
 
 
+def extract_links(text: str, limit: int = 8) -> list:
+    """All unique http(s) links in text, in order of appearance."""
+    seen, out = set(), []
+    for u in re.findall(r"https?://[^\s)\]>\"'|,;*]+", text or ""):
+        u = u.rstrip(".,:;!?")
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out[:limit]
+
+
+def build_read_input(search_text: str, links: list, budget: int) -> str:
+    """Every link first (never cut), then search text to fill what is left of the character budget."""
+    links = links or extract_links(search_text)
+    block = "\n".join(links)
+    rest = search_text[: max(0, budget - len(block))]
+    return (f"Links found:\n{block}\n\n" if block else "") + rest
+
+
 def use_example(text: str):
     st.session_state.topic_input = text
     st.session_state.autorun = True
@@ -279,6 +299,12 @@ def is_limit_error(e: Exception) -> bool:
     msg = str(e).lower()
     return any(k in msg for k in (
         "413", "429", "rate_limit", "rate limit", "too large", "tokens per minute", "request too large"))
+
+
+def is_tool_call_error(e: Exception) -> bool:
+    """The model produced a malformed tool call (e.g. missing 'query'). Random, usually fixed by retrying."""
+    msg = str(e).lower()
+    return "tool_use_failed" in msg or "tool call validation failed" in msg
 
 
 def wait_seconds(e: Exception):
@@ -297,6 +323,9 @@ def with_budget(fn, budget: int, notify, label: str, floor: int = 1200, attempts
         try:
             return fn(budget)
         except Exception as e:
+            if is_tool_call_error(e) and n < attempts - 1:
+                notify(f"{label}: the model returned a malformed tool call. Retrying.")
+                continue
             if not is_limit_error(e) or n == attempts - 1:
                 raise
             m = re.search(r"Limit (\d+), Requested (\d+)", str(e))
@@ -352,8 +381,20 @@ def run_with_progress(topic: str, tracker_slot, notice_slot) -> None:
                 agent = web_search_agent()
                 r = agent.invoke({"messages": [{"role": "user",
                     "content": f"Find recent, reliable, accurate information about: {topic}"}]})
+                raw = "\n".join(as_text(m) for m in r["messages"])
+                state["links"] = extract_links(raw)
                 return as_text(r["messages"][-1].content)
-            return with_budget(call, 1000, notify, "Search")
+            try:
+                return with_budget(call, 1000, notify, "Search")
+            except Exception as e:
+                if not is_tool_call_error(e):
+                    raise
+                # The model kept sending a broken search request: call the search tool directly.
+                notify("Search: the model kept sending a broken search request, "
+                       "so the search tool was called directly.")
+                text = as_text(web_search.invoke({"query": topic}))
+                state["links"] = extract_links(text)
+                return text
 
         state["search_results"] = step("search", do_search)
 
@@ -364,15 +405,25 @@ def run_with_progress(topic: str, tracker_slot, notice_slot) -> None:
                 r = agent.invoke({"messages": [{"role": "user", "content":
                     f"Based on the following research results about: '{topic}'\n"
                     f"Pick the most relevant url and scrape for deeper content.\n\n"
-                    f"Search Results :\n {state['search_results'][:budget]}"}]})
+                    f"Search Results :\n {build_read_input(state['search_results'], state.get('links'), budget)}"}]})
                 return as_text(r["messages"][-1].content)
             try:
-                return with_budget(call, 6000, notify, "Read")
+                return with_budget(call, 800, notify, "Read", floor=800)
             except Exception as e:
                 if is_limit_error(e):
                     notify("Read: the page was too large for the model's token limit, "
                            "so the report is based on the search results only.")
                     return "(Page content unavailable: it exceeded the model's token limit.)"
+                if is_tool_call_error(e):
+                    links = state.get("links") or extract_links(state["search_results"])
+                    if links:
+                        # The model kept sending a broken scrape request: scrape the top link directly.
+                        notify("Read: the model kept sending a broken scrape request, "
+                               "so the top link was scraped directly.")
+                        return as_text(scrape_url.invoke({"url": links[0]}))
+                    notify("Read: the model kept sending a broken scrape request and no link was found, "
+                           "so the report is based on the search results only.")
+                    return "(Page content unavailable: no link could be opened.)"
                 raise
 
         state["scrape_results"] = step("scrape", do_scrape)
